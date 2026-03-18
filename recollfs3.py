@@ -1,0 +1,307 @@
+import fuse # type: ignore
+from dataclasses import dataclass
+import os
+import sys
+import stat
+import pathlib
+from recoll import recoll # type: ignore
+import urllib
+import argparse
+import logging
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
+from typing import Generator
+from pathlib import Path
+import errno
+import time
+
+# Utility functions
+def NormalizePath(x:str) -> str:
+    """Normalize a path and expand ~"""
+    return (str(pathlib.PosixPath(x).expanduser()))
+
+def setup_logging(debug: bool = False) -> None:
+    """ Set log level"""
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        stream=sys.stderr
+    )
+
+def is_readable_file(path:str) -> bool:
+    """ Check if path is a regular file with read permission"""
+    p = Path(path)
+    return p.is_file() and os.access(p, os.R_OK)
+
+def split_path(path: str) -> tuple[str, str]:
+    """Return (dirname, basename) for a path.
+    For the root ('/'), dirname is '/' and basename is ''.
+    """
+    path = path.rstrip('/')
+    if path == '':
+        return ('/', '')
+    dirname, basename = os.path.split(path)
+    # os.path.split on '/quantum' returns ('/', 'quantum')
+    return dirname, basename
+    
+
+@contextmanager
+def silence_fd() -> Generator[None, None, None]:
+    """Temporarily redirect stdout (fd 1) and stderr (fd 2) to /dev/null.
+    Used to suppress output from noisy library functions.
+
+    Example:
+        with silence_fd():
+            some_c_extension_function()
+            print("This Python print is also suppressed")
+    """
+    # Open the null device
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+
+    # Save original file descriptors
+    original_stdout_fd = os.dup(1)   # duplicate stdout
+    original_stderr_fd = os.dup(2)   # duplicate stderr
+
+    try:
+        # Redirect stdout and stderr to /dev/null
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+
+        # Yield control to the with‑block
+        yield
+
+    finally:
+        # Restore original file descriptors
+        os.dup2(original_stdout_fd, 1)
+        os.dup2(original_stderr_fd, 2)
+
+        # Close the duplicates and the null device
+        os.close(original_stdout_fd)
+        os.close(original_stderr_fd)
+        os.close(devnull_fd)            
+
+# Representation of recoll hits
+@dataclass(frozen=True)
+class FileInfo:
+    virtual_path: str # Path inside the mount, e.g., "/quantum/paper.pdf"
+    real_path: str    # Actual filesystem path of the document
+    ## Perhaps we need attributes, file size etc.
+
+class recollclient:
+    """
+    Recoll interface
+      Args:
+          confdir: Recoll config directory
+"""
+
+    def __init__(self, confdir: str):
+        """
+        Initialize self
+        Args:
+          confdir: Recoll config directory
+        """
+        confdir = NormalizePath(confdir)
+        try:
+            with silence_fd():
+                self.rdb = recoll.connect(confdir=confdir)
+        except Exception:
+            logging.error("Could not open recoll confdir: %s", confdir)
+            exit(1)
+        self.rdbquery = self.rdb.query()
+        logging.debug("Recoll client created with config dir %s", confdir)
+
+    def query(self, qstring:str) -> dict[str, FileInfo]:
+        nres = self.rdbquery.execute(qstring)
+        # We omit duplicate basenames, but emit a warning
+        hits = dict()
+        for i in range(nres):
+            doc = self.rdbquery.fetchone()
+            path = doc.url[7:]
+            if not(is_readable_file(path)):
+                logging.warning("Ignoring %s (not a readable file", path)
+                continue
+            basename = os.path.basename(path)
+            if basename in hits:
+                logging.warning("Ignoring duplicate basename %s for %s",
+                                basename, path)
+                continue
+            # Todo: check if virtualpath is a valid path name.
+            hits[basename] = FileInfo(
+                virtual_path = "/" + qstring + "/" + basename,
+                real_path = path)
+        return hits
+
+class RecollFS(fuse.Fuse): # type: ignore[misc]
+    def __init__(self, confdir:str):
+        super().__init__(dash_s_do='setsingle')
+        self.rc = recollclient(confdir)
+        self.subdirs: dict[str, dict[str, FileInfo]] = {}
+
+    def getattr(self, path):
+        dirname, basename = split_path(path)
+
+    # Root directory
+        if dirname == '/' and basename == '':
+            st = fuse.Stat()
+            st.st_mode = stat.S_IFDIR | 0o755
+            st.st_nlink = 2 + len(self.subdirs)   # + '.' and '..'
+            st.st_uid = os.getuid()
+            st.st_gid = os.getgid()
+            now = time.time()
+            st.st_atime = now
+            st.st_mtime = now
+            st.st_ctime = now
+            return st
+
+        # Subdirectory (query)
+        if dirname == '/' and basename in self.subdirs:
+            st = fuse.Stat()
+            st.st_mode = stat.S_IFDIR | 0o755
+            st.st_nlink = 2 + len(self.subdirs[basename])
+            st.st_uid = os.getuid()
+            st.st_gid = os.getgid()
+            now = time.time()
+            st.st_atime = now
+            st.st_mtime = now
+            st.st_ctime = now 
+            return st
+
+        # File inside a subdirectory
+        dirname = dirname.lstrip("/")
+        if dirname in self.subdirs:
+            files = self.subdirs[dirname] 
+            if basename in files:
+                real_path = files[basename].real_path
+                try:
+                    # Get real file stats
+                    stat_res = os.lstat(real_path)
+                    st = fuse.Stat()
+                    # Copy relevant attributes
+                    for attr in ('st_mode', 'st_ino', 'st_dev', 'st_nlink',
+                                 'st_uid', 'st_gid', 'st_size', 'st_atime',
+                                 'st_mtime', 'st_ctime'):
+                        setattr(st, attr, getattr(stat_res, attr))
+                    # Force read-only
+                    st.st_mode &= ~0o222
+                    return st
+                except FileNotFoundError:
+                    logging.warning(f"Real file missing: {real_path}")
+                    # Remove stale entry
+                    del self.subdirs[dirname][basename]
+                    return -errno.ENOENT
+        logging.warning("getattr error: %s", path)
+        return -errno.ENOENT
+
+    def readdir(self, path, offset):  ## Fixme: respect offset
+        dirname, basename = split_path(path)
+
+        # Root directory
+        if dirname == '/' and basename == '':
+            yield fuse.Direntry('.')
+            yield fuse.Direntry('..')
+            for qname in self.subdirs.keys():
+                yield fuse.Direntry(qname)
+            return
+
+        # Subdirectory (query)
+        if basename in self.subdirs:
+            yield fuse.Direntry('.')
+            yield fuse.Direntry('..')
+            for fname in self.subdirs[basename].keys():
+                yield fuse.Direntry(fname)
+            return
+
+        return -errno.ENOENT
+
+    def mkdir(self, path, mode):
+        logging.debug("mkdir '%s'", path)
+        path = path.lstrip("/").strip("/")
+        if (path in self.subdirs.keys()):
+            return errno.EINVAL
+        fileinfos = self.rc.query(path)
+        self.subdirs[path] = fileinfos
+
+    def open(self, path, flags):
+        """Open a file. Only read-only access is allowed."""
+        logging.debug(f"open({path}, {flags})")
+        try:
+            dirname, basename = split_path(path)
+            dirname = dirname.lstrip("/")
+
+            # Check that the path corresponds to a file
+            if dirname not in self.subdirs:
+                return -errno.ENOENT
+            files = self.subdirs[dirname]
+            if basename not in files:
+                return -errno.ENOENT
+
+            # Only allow read-only access
+            if flags & (os.O_WRONLY | os.O_RDWR):
+                return -errno.EACCES
+
+            # Success – no file handle needed
+            return 0
+        except Exception as e:
+            logging.exception(f"Unexpected error in open for {path}")
+            return -errno.EIO
+
+
+    def read(self, path, size, offset):
+        """Read data from a file."""
+        logging.debug(f"read({path}, {size}, {offset})")
+        try:
+            dirname, basename = split_path(path)
+            dirname = dirname.lstrip("/")
+
+            if dirname not in self.subdirs:
+                return -errno.ENOENT
+            files = self.subdirs[dirname]
+            if basename not in files:
+                return -errno.ENOENT
+
+            real_path = files[basename].real_path
+
+            # Open the real file and read the requested chunk
+            with open(real_path, 'rb') as f:
+                f.seek(offset)
+                data = f.read(size)
+                return data  # bytes object
+
+        except FileNotFoundError:
+            logging.warning(f"Real file missing: {real_path}")
+            # Optionally remove the stale entry
+            del self.subdirs[dirname][basename]
+            return -errno.ENOENT
+        except PermissionError:
+            return -errno.EACCES
+        except Exception as e:
+            logging.exception(f"Unexpected error in read for {path}")
+            return -errno.EIO
+
+
+        
+
+  
+def main() -> None:
+    fuse.fuse_python_api = (0, 2)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-d", "--debug", action = "store_true",
+                        help = "print debugging messages")
+    parser.add_argument("-c", "--confdir", default="~/test/.recoll",
+                        help = "recoll config directory (default: ~/.recoll")
+    parser.add_argument("mountpoint")
+    options = parser.parse_args()
+    setup_logging(options.debug)
+
+    server = RecollFS(options.confdir)
+    # We don't want the user to fiddle around with fuse options
+    ##args = [options.mountpoint, "-f", "-d"] 
+    server.parse([options.mountpoint, "-f", "-s"])
+
+    # Start the FUSE main loop
+    server.main()
+
+
+if __name__ == '__main__':
+    main()
+    
