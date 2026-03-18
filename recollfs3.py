@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 import fuse # type: ignore
 from dataclasses import dataclass
 import os
@@ -132,10 +134,32 @@ class recollclient:
         return hits
 
 class RecollFS(fuse.Fuse): # type: ignore[misc]
-    def __init__(self, confdir:str):
+    def __init__(self):
         super().__init__(dash_s_do='setsingle')
-        self.rc = recollclient(confdir)
+        # Defaults for custom options
+        self.confdir = "~/.recoll"
+        self.debug_recollfs = False   # our own debug flag
         self.subdirs: dict[str, dict[str, FileInfo]] = {}
+
+        # Define custom options
+        self.parser.add_option(
+            mountopt="confdir", 
+            default=self.confdir,
+            help="Recoll config directory (default: ~/.recoll)"
+        )
+        self.parser.add_option(
+            mountopt="debug_recollfs", # avoid confusion with fuse -d
+            action="store_true",
+            default=False,
+            help="Enable recollfs3 debug logging"
+        )
+
+    def finalize_init(self):
+        self.confdir = os.path.expanduser(self.confdir)
+        # Set up logging based on self.debug_recollfs
+        setup_logging(self.debug_recollfs)
+        # Initialize Recoll client
+        self.rc = recollclient(self.confdir)
 
     def getattr(self, path):
         dirname, basename = split_path(path)
@@ -284,19 +308,13 @@ class RecollFS(fuse.Fuse): # type: ignore[misc]
   
 def main() -> None:
     fuse.fuse_python_api = (0, 2)
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--debug", action = "store_true",
-                        help = "print debugging messages")
-    parser.add_argument("-c", "--confdir", default="~/test/.recoll",
-                        help = "recoll config directory (default: ~/.recoll")
-    parser.add_argument("mountpoint")
-    options = parser.parse_args()
-    setup_logging(options.debug)
 
-    server = RecollFS(options.confdir)
-    # We don't want the user to fiddle around with fuse options
-    ##args = [options.mountpoint, "-f", "-d"] 
-    server.parse([options.mountpoint, "-f", "-s"])
+    server = RecollFS()
+    # Force single-threaded, duplicate -s is harmless.
+    forced_args = ["-s"]
+    server.parse(sys.argv + forced_args, values = server)
+    # Finalize initialization using parsed cusom options
+    server.finalize_init()
 
     # Start the FUSE main loop
     server.main()
