@@ -16,6 +16,19 @@ from pathlib import Path
 import errno
 import time
 
+# Some file managers (Windows explorer, Caja (Linux) behave like this:
+# When the user wants to create a folder and is prompted for the folder
+# name, the file manager has already created an empty folder with a
+# placeholder name like "New Folder" and renames it afterwards.
+# Therefor when performing a recoll query, we check if the query string
+# i a placeholder name and return an empty result in such cases without
+# doing the recoll query.
+PLACEHOLDER_NAMES = {
+    "New Folder", "untitled folder",  # English
+    "Neuer Ordner", "Unbenannter Ordner",  # German
+    # Add others as needed
+}
+
 # Utility functions
 
 
@@ -243,7 +256,10 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
         path = path.lstrip("/").strip("/")
         if (path in self.subdirs.keys()):
             return -errno.EINVAL
-        fileinfos = self.rc.query(path)
+        if path in PLACEHOLDER_NAMES:
+            fileinfos = {}
+        else:
+            fileinfos = self.rc.query(path)
         self.subdirs[path] = fileinfos
 
     def rmdir(self, path):
@@ -258,7 +274,7 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
 
         del self.subdirs[basename]
         logging.debug(f"Removed query directory '{basename}'")
-    
+
     def open(self, path, flags):
         """Open a file. Only read-only access is allowed."""
         logging.debug(f"open({path}, {flags})")
@@ -289,7 +305,7 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
 
         dirname, basename = split_path(path)
         dirname = dirname.lstrip("/")
-        
+
         if dirname not in self.subdirs:
             return -errno.ENOENT
         files = self.subdirs[dirname]
@@ -319,10 +335,10 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
     def unlink(self, path):
         """Unlink a file in a search folder."""
         logging.debug("unlink: %s", path)
-        
+
         dirname, basename = split_path(path)
         dirname = dirname.lstrip("/")
-        
+
         if dirname not in self.subdirs:
             return -errno.ENOENT
         files = self.subdirs[dirname]
@@ -331,17 +347,45 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
 
         del files[basename]
         logging.debug(f"Removed '{basename}' from '{dirname}'")
-        
+
+    def rename(self, old: str, new: str) -> int:
+        """
+        Rename a query folder, also updating its contents with a recoll query
+        """
+
+        logging.debug(f"rename({old} -> {new})")
+        old_dirname, old_basename = split_path(old)
+        new_dirname, new_basename = split_path(new)
+
+        # Only supported case: Renaming query directory
+        if old_dirname == '/' and new_dirname == '/':
+            # Both must be query directories
+            if old_basename not in self.subdirs:
+                return -errno.ENOENT
+            if new_basename in self.subdirs:
+                return -errno.EEXIST
+            # Execute new query for the destination
+            if new_basename in PLACEHOLDER_NAMES:
+                fileinfos = {}
+            else:
+                fileinfos = self.rc.query(new_basename)
+            self.subdirs[new_basename] = fileinfos
+            del self.subdirs[old_basename]
+            logging.debug("Renamed query directory %s -> %s",
+                          old_basename, new_basename)
+            return 0
+        else:
+            return -errno.ENOTSUP
+
+
 def main() -> None:
     fuse.fuse_python_api = (0, 2)
-
     server = RecollFS()
     # Force single-threaded, duplicate -s is harmless.
     forced_args = ["-s"]
-    server.parse(sys.argv + forced_args, values= server)
+    server.parse(sys.argv + forced_args, values=server)
     # Finalize initialization using parsed cusom options
     server.finalize_init()
-
     # Start the FUSE main loop
     server.main()
 
