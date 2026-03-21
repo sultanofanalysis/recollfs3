@@ -8,13 +8,13 @@ import stat
 import pathlib
 from recoll import recoll  # type: ignore
 import urllib
-import argparse
 import logging
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from typing import Generator
 from pathlib import Path
 import errno
 import time
+import re
 
 # Some file managers (Windows explorer, Caja (Linux) behave like this:
 # When the user wants to create a folder and is prompted for the folder
@@ -160,7 +160,8 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
         super().__init__(dash_s_do='setsingle')
         # Defaults for custom options
         self.confdir = "~/.recoll"
-        self.debug_recollfs = False   # our own debug flag
+        self.debug_recollfs = False # our own debug flag
+        self.transform_query = False # workaround for windows, see create_query
         self.subdirs: dict[str, dict[str, FileInfo]] = {}
 
         # Define custom options
@@ -175,6 +176,39 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
             default=False,
             help="Enable recollfs3 debug logging"
         )
+        self.parser.add_option(
+            mountopt="transform_query",
+            action="store_true",
+            default=False,
+            help="Enable workarounds for using recollfs via samba on windows"
+        )
+
+    def create_query_dir(self, qstring: str) -> dict[str, FileInfo]:
+        """
+        Workarounds necessary when accessing a RecollFS folder using a samba
+        mount from windows.
+        1. When creating  folder from the windows explorer, the explorer 
+        immediately creates a folder using a placeholder name and renames
+        it when the user enters a folder name.
+        Some linux file managers (e.g. caja) show the same behavior.
+        Hence placeholder names should not trigger queries, but just
+        return an empty query directory.
+        2. The explorer does not allow the use of colons and quotation marks
+        in folder names. This would prevent the user from searches like
+        "author:einstein" or '"bohmian mechanics"' (exact phrase search).
+        As a workaround, we let the user search for "author_einstein" and
+        "{bohmain mechanics}", and transfrom this into "author:einstein" and
+        '"bohmian mechanics"'.
+        """
+        if qstring in PLACEHOLDER_NAMES:
+            logging.debug("leaving directory empty for placeholde name %s",
+                          qstring)
+            return {}
+        if self.transform_query:
+            qstring = qstring.replace('author_', 'author:')
+            qstring = qstring.replace('title_', 'title:')
+            qstrings = re.sub(r'\{([^{}]*)\}', r'"\1"', qstring)
+        return self.rc.query(qstring)
 
     def finalize_init(self):
         self.confdir = os.path.expanduser(self.confdir)
@@ -256,10 +290,7 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
         path = path.lstrip("/").strip("/")
         if (path in self.subdirs.keys()):
             return -errno.EINVAL
-        if path in PLACEHOLDER_NAMES:
-            fileinfos = {}
-        else:
-            fileinfos = self.rc.query(path)
+        fileinfos = self.create_query_dir(path)
         self.subdirs[path] = fileinfos
 
     def rmdir(self, path):
@@ -365,10 +396,7 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
             if new_basename in self.subdirs:
                 return -errno.EEXIST
             # Execute new query for the destination
-            if new_basename in PLACEHOLDER_NAMES:
-                fileinfos = {}
-            else:
-                fileinfos = self.rc.query(new_basename)
+            fileinfos = self.create_query_dir(new_basename)
             self.subdirs[new_basename] = fileinfos
             del self.subdirs[old_basename]
             logging.debug("Renamed query directory %s -> %s",
