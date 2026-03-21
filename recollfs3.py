@@ -207,7 +207,7 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
         if self.transform_query:
             qstring = qstring.replace('author_', 'author:')
             qstring = qstring.replace('title_', 'title:')
-            qstrings = re.sub(r'\{([^{}]*)\}', r'"\1"', qstring)
+            qstring = re.sub(r'\{([^{}]*)\}', r'"\1"', qstring)
         return self.rc.query(qstring)
 
     def finalize_init(self):
