@@ -1,6 +1,6 @@
 RecollFS3: Rewrite of https://github.com/pidlug/recollfs in python3. 
 
-*Yet in a rudimentary stage and poorly tested. Use at your own risk.*
+Yet in development and not ficceitently tested. Use at your own risk.
 
 In contrast to the original recollfs, recoll hits appear as ordinary file, not symlinks.
 I have also give credits to deepseek, which was a great help for understanding the poorly documented fuse-python API.
@@ -38,11 +38,10 @@ Currently, only a limited set of fuse operations is supported:
 3. Placeholder folder names:
 Some file managers (e.g. caja) show this behavior when creating a directory: When the user is prompted for the folder name, the folder has already been create with a placeholder name like 'New Directory' and renamed if the user folder enters a folder name. Therefor Recollfs3 checks if the folder name is a just placeholder and leaves the folder empty (not recoll search). I your file manager uses a different plaeholder name, add it to the list PLACEHOLDER_NAMES at the beginning of recollfs3.py.
 
-4. Workarounds for windows (recollfs3 does not run on windows hosts, but can use fecollfs3 mounts via samba):
-The windows explorer not allow the use of colons and quotation marks in folder names. This would prevent the user from searches like "author:einstein" or '"bohmian mechanics"' (exact phrase search). As a workaround, we let the user search for "author_einstein" and "{bohmain mechanics}",
-and transfrom this into "author:einstein" and "bohmian mechanics"' before passing the search to recoll.
-In order to enable these workarounds, the option -o transform_query has to be used.
+4. recollfs3 mounts can be shared with samba.
+For using the full functionality under windows, workarounds have to be enabled using the
+option -o transform_query.
+The windows explorer not allow the use of colons and quotation marks in folder names. This would prevent the user from searches like "author:einstein" or '"bohmian mechanics"' (exact phrase search). With -o transform_query, the user can search for "author_einstein" and "{bohmian
+mechanics}", which is transformed into "author:einstein" and "bohmian mechanics"' before passing the search to recoll.
 
-3. Future plans:
-- Improve usability, if the search folder is mounted via samba to overcome annoyances of the windows explorer. E.g. the windows explorer does not allow folders with colon in the folder name, so searches of the of the form author:name are currently not possible using the windows explorer on a samba share. Also, the windows explorer does not allow quotation marks in the folder name, so search for an exact phrase is not possible. 
-- Implementing the creation of files in the mounted subfolder (use case: create a tar.gz from a query folder from the file manager menu.)
+

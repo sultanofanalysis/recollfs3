@@ -24,7 +24,7 @@ import re
 # i a placeholder name and return an empty result in such cases without
 # doing the recoll query.
 PLACEHOLDER_NAMES = {
-    "New Folder", "untitled folder",  # English
+    "New Folder", "New folder", "untitled folder",  # English
     "Neuer Ordner", "Unbenannter Ordner",  # German
     # Add others as needed
 }
@@ -183,6 +183,21 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
             help="Enable workarounds for using recollfs via samba on windows"
         )
 
+    def dumpfs(self):
+        """ Debug utility function"""
+        if not self.debug_recollfs:
+            return
+        print("File system summary: %d folders:" % len(self.subdirs), file=sys.stderr)
+        for dir in self.subdirs.keys():
+            files = list(self.subdirs[dir].keys())
+            nfiles = len(files)
+            print("  %s: %d files" % (dir, nfiles), file=sys.stderr)
+            nmax = min(nfiles, 5)
+            for i in range(nmax):
+                print("    %s" % files[i], file=sys.stderr)
+            if nfiles >= 5:
+                print("    ...", file=sys.stderr)
+
     def create_query_dir(self, qstring: str) -> dict[str, FileInfo]:
         """
         Workarounds necessary when accessing a RecollFS folder using a samba
@@ -218,6 +233,7 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
         self.rc = recollclient(self.confdir)
 
     def getattr(self, path):
+        logging.debug("getattr: %s", path)
         dirname, basename = split_path(path)
 
     # Root directory
@@ -269,7 +285,7 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
                     # Remove stale entry
                     del self.subdirs[dirname][basename]
                     return -errno.ENOENT
-# logging.debug("getattr error: %s", path)
+        logging.debug("getattr error: %s", path)
         return -errno.ENOENT
 
     def readdir(self, path, offset):  # Fixme: respect offset
@@ -297,15 +313,13 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
         if basename in self.subdirs:
             return -errno.EEXIST
 
-        if basename in PLACEHOLDER_NAMES:
-            fileinfos = {}
-        else:
-            fileinfos = self.create_query_dir(basename)
+        fileinfos = self.create_query_dir(basename)
         self.subdirs[basename] = fileinfos
         return 0
 
     def rmdir(self, path):
         logging.debug("rmdir: %s", path)
+        self.dumpfs()
         dirname, basename = split_path(path)
         if dirname != '/' or basename not in self.subdirs:
             return -errno.ENOENT
@@ -318,6 +332,7 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
         self.Invalidate(path)
         self.Invalidate("/")
         logging.debug(f"Removed query directory '{basename}'")
+        self.dumpfs()
 
     def open(self, path, flags):
         """Open a file. Only read-only access is allowed."""
@@ -399,23 +414,34 @@ class RecollFS(fuse.Fuse):  # type: ignore[misc]
         logging.debug(f"rename({old} -> {new})")
         old_dirname, old_basename = split_path(old)
         new_dirname, new_basename = split_path(new)
+        logging.debug("old dirname, basename: '%s', '%s'", old_dirname, old_basename)
+        logging.debug("new dirname, basename: '%s', '%s'", new_dirname, new_basename)
+        self.dumpfs()
 
         # Only support renaming directories directly under the root
         if old_dirname != '/' or new_dirname != '/':
+            logging.debug("ENOTSUP")
             return -errno.ENOTSUP
         if not old_basename or not new_basename:
+            logging.debug("EINVAL")
             return -errno.EINVAL
         if old_basename not in self.subdirs:
+            logging.debug("ENOENT")
             return -errno.ENOENT
-        if new_basename in self.subdirs:
-            return -errno.EEXIST
-
-        if new_basename in PLACEHOLDER_NAMES:
-            fileinfos = {}
+        if new_basename in self.subdirs: 
+            # posix allows rename if the target is empty
+            # in this case it should remain empty after rename
+            if len(self.subdirs[new_basename]) == 0:
+                del(self.subdirs[old_basename])
+            else:
+                logging.debug("EEXIST")
+                return -errno.EEXIST
         else:
             fileinfos = self.create_query_dir(new_basename)
-        self.subdirs[new_basename] = fileinfos
-        del self.subdirs[old_basename]
+            self.subdirs[new_basename] = fileinfos
+            del self.subdirs[old_basename]
+        logging.debug(f"sucessfully renamed({old} -> {new})")
+        self.dumpfs()
         return 0
 
 
